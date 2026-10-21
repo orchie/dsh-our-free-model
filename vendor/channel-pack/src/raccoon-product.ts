@@ -309,6 +309,23 @@ export const RACCOON_IMAGE_CAPABILITY_OVERRIDES: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * 同一模型的**日期快照后缀**，例如 `sn-deepseek-v4-1-flash-1017` 的 `-1017`。
+ *
+ * 远端目录把同一模型按快照日期重复上架，而白名单里的实测证据是按**基础 id**
+ * 记的；只认精确 id 会让同一天后上架的变体掉回纯文本，宿主随即把图片换成文本
+ * 占位符，模型就答「看不到图片」——实测报障即此形态。
+ *
+ * ⚠️ **只剥 4 位数字**，不做前缀匹配：`sn-deepseek-v4-1-flash-lite` 这类真正
+ * 不同的模型不该继承本族的能力结论。
+ */
+const DATED_SNAPSHOT_SUFFIX = /-\d{4}$/
+
+/** @returns 去掉日期快照后缀的族名；无后缀时原样返回。 */
+export function raccoonImageFamily(modelId: string): string {
+  return modelId.replace(DATED_SNAPSHOT_SUFFIX, '')
+}
+
+/**
  * 远端目录条目的图片能力判定 —— **远端解析路径专用**。
  *
  * ⚠️ 兜底表路径（`fallbackToRemote`）不走本函数：它的真相源是
@@ -321,6 +338,8 @@ export const RACCOON_IMAGE_CAPABILITY_OVERRIDES: ReadonlySet<string> = new Set([
  */
 export function raccoonSupportsImage(modelId: string, tags: readonly string[]): boolean {
   if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(modelId)) return true
+  // 日期快照变体继承本族的实测结论（见 `DATED_SNAPSHOT_SUFFIX`）。
+  if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(raccoonImageFamily(modelId))) return true
   return tags.includes('vision') || tags.includes('image') || tags.includes('image-understanding')
 }
 

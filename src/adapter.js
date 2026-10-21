@@ -18,7 +18,7 @@
  */
 
 import { applyFingerprint, baseModelId, endpointFor, mintRequestId, sessionForConversation, wireFor } from './upstream.js'
-import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing } from './messages.js'
+import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing, needsVision } from './messages.js'
 import { CODE, UpstreamError, postStreamed } from './http.js'
 import { postSealedStreamed } from './eac.js'
 import { postKiloStreamed } from './kilo.js'
@@ -231,10 +231,36 @@ export class FreeModelAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: 'our free model is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return
     }
-    const candidates = comboChain(entry, snapshot.catalog)
-    if (candidates.length === 0) {
+    const ordered = comboChain(entry, snapshot.catalog)
+    if (ordered.length === 0) {
       rejectedTurn(0)
       yield { type: 'finish', reason: { kind: 'error', failure: { message: `the chain "${entry.name}" has no model available on this egress`, code: CODE.server } } }
+      return
+    }
+    /**
+     * An image-bearing turn may only walk the members that can read it.
+     *
+     * The chain advertises image input when *any* member supports it (see
+     * `buildComboCatalog`), which is what keeps the host from replacing the
+     * attachment with a text placeholder before we ever see it. The price is
+     * this filter: handing the image to a text-only member would make the host
+     * project it back into a placeholder, and the model would answer "I cannot
+     * see the image" — the exact symptom that made the chain advertise the
+     * intersection in the first place.
+     *
+     * Filtering is not falling back to nothing: if no member can read images the
+     * turn ends with a message that says so, instead of a model quietly
+     * answering about a placeholder.
+     */
+    const wantsVision = needsVision(options.messages)
+    const candidates = wantsVision ? ordered.filter(candidate => candidate.vision === true) : ordered
+    if (wantsVision && candidates.length === 0) {
+      rejectedTurn(0)
+      this.deps.warn?.(`our-free-model: chain "${entry.name}" got an image turn but no member can read images`)
+      yield { type: 'finish', reason: { kind: 'error', failure: {
+        message: `the chain "${entry.name}" was sent an image, but none of its members accepts image input — add a vision-capable model to the chain or send text only`,
+        code: CODE.server,
+      } } }
       return
     }
     const tried = []

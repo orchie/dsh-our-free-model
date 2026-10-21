@@ -22,10 +22,17 @@
  *   its load. The rotation cursor lives in memory: a restart losing it costs
  *   nothing but a different starting point.
  *
- * Capacities are the *intersection*, not the union. A chain that advertises
- * vision because its head supports it hands a fallback an image it cannot read;
- * a chain that advertises a 1M window because its head has one overruns a
- * fallback at 128K. The honest numbers are the ones every candidate can honour.
+ * Capacities are the *intersection*, not the union. A chain that advertises a 1M
+ * window because its head has one overruns a fallback at 128K, so the honest
+ * number is the one every candidate can honour.
+ *
+ * Vision is the exception, and deliberately so. The host decides whether to keep
+ * an attached image or replace it with a text placeholder by reading the
+ * modalities the adapter publishes, so the intersection does not protect anyone
+ * — it makes the entire chain refuse images, and the member that *could* read
+ * one never sees it. The chain therefore advertises image input when any member
+ * supports it, and `runCombo` walks only the image-capable members on a turn
+ * that actually carries an image.
  *
  * @module src/combos.js
  */
@@ -118,8 +125,10 @@ export function buildComboCatalog(combos, catalog) {
       combo: members.map(entry => entry.id),
       strategy: combo.strategy,
       stickyLimit: combo.stickyLimit,
-      // Intersection, not union — see the module header.
-      vision: members.every(entry => entry.vision === true),
+      // **Any** member, not every one — see the module header. The host's
+      // admission gate keys on this field, so the intersection makes the whole
+      // chain refuse images; the per-turn protection lives in `runCombo`.
+      vision: members.some(entry => entry.vision === true),
       reasoning: members.some(entry => entry.reasoning === true),
       contextWindow: Math.min(...members.map(entry => number(entry.contextWindow) ?? 131072)),
       maxOutput: Math.min(...members.map(entry => number(entry.maxOutput) ?? 32768)),

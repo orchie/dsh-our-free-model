@@ -54,6 +54,7 @@ const suites = [
   ['channel-source', 'channel-pack-test.mjs', ['--source', '--channels-only']],
   ['channel-network', 'channel-network-test.mjs', []],
   ['channel-image-capability', 'channel-image-capability-test.mjs', []],
+  ['chain-vision', 'chain-vision-test.mjs', []],
   ['channel-credits-rpc', 'channel-credits-rpc-test.mjs', []],
   ['channel-credits-ui', 'channel-credits-ui-test.mjs', []],
   ['channel-model-actions', 'channel-model-actions-test.mjs', []],

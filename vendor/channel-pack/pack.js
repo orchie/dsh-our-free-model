@@ -42880,8 +42880,17 @@ var RACCOON_IMAGE_CAPABILITY_OVERRIDES = /* @__PURE__ */ new Set([
   "sn-deepseek-v4-1-flash",
   "sn-glm-5-3-flash"
 ]);
+// 同一模型按快照日期重复上架（`sn-deepseek-v4-1-flash` 与其 `-1017` 变体），
+// 白名单证据只记了基础 id；只认精确 id 会让变体掉回纯文本，宿主随即把图片换成
+// 文本占位符 → 模型答「看不到图片」。只剥 4 位数字，不做前缀匹配：真正不同的
+// 模型（`…-flash-lite`）不该继承本族结论。
+var DATED_SNAPSHOT_SUFFIX = /-\d{4}$/;
+function raccoonImageFamily(modelId) {
+  return modelId.replace(DATED_SNAPSHOT_SUFFIX, "");
+}
 function raccoonSupportsImage(modelId, tags) {
   if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(modelId)) return true;
+  if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(raccoonImageFamily(modelId))) return true;
   return tags.includes("vision") || tags.includes("image") || tags.includes("image-understanding");
 }
 var RACCOON = {
@@ -69217,5 +69226,7 @@ export {
   makeReadImage,
   makeReadImageRequest,
   name,
-  parseWindowsProxy
+  parseWindowsProxy,
+  raccoonImageFamily,
+  raccoonSupportsImage
 };

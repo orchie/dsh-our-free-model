@@ -22,15 +22,23 @@
  *   its load. The rotation cursor lives in memory: a restart losing it costs
  *   nothing but a different starting point.
  *
- * Capacities are the *intersection*, not the union. A chain that advertises
- * vision because its head supports it hands a fallback an image it cannot read;
- * a chain that advertises a 1M window because its head has one overruns a
- * fallback at 128K. The honest numbers are the ones every candidate can honour.
+ * Capacities are the *intersection*, not the union. A chain that advertises a 1M
+ * window because its head has one overruns a fallback at 128K, so the honest
+ * number is the one every candidate can honour.
+ *
+ * Vision is the exception, and deliberately so. The host decides whether to keep
+ * an attached image or replace it with a text placeholder by reading the
+ * modalities the adapter publishes, so the intersection does not protect anyone
+ * — it makes the entire chain refuse images, and the member that *could* read
+ * one never sees it. The chain therefore advertises image input when any member
+ * supports it, and `runCombo` walks only the image-capable members on a turn
+ * that actually carries an image.
  *
  * @module src/combos.js
  */
 
 import { createHash } from 'node:crypto'
+import { benchedMembers, preferHealthy, shouldRetireBench } from './link-health.js'
 
 export const COMBO_CHANNEL = 'combo'
 export const COMBO_PREFIX = 'combo:'
@@ -153,8 +161,17 @@ export function buildComboCatalog(combos, catalog, options = {}) {
       combo: members.map(entry => entry.id),
       strategy: combo.strategy,
       stickyLimit: combo.stickyLimit,
-      // Intersection, not union — see the module header.
-      vision: members.every(entry => entry.vision === true),
+      // **Any** member, not every one. This is the one place the intersection
+      // rule of the header does not apply, and the reason is the host's gate:
+      // `inputModalities` is what decides whether an attached image is kept or
+      // projected into a text placeholder (see `raccoon-adapter.ts` / `trae-adapter.ts`
+      // in the channel pack, both of which build that field from a capability
+      // check). Advertising the intersection therefore does not "protect" a
+      // text-only member — it makes the whole chain refuse images at admission,
+      // so the user cannot attach one at all, and a capable member never gets the
+      // chance. The protection is applied per turn instead, in `runCombo`: an
+      // image-bearing turn only walks the members that can actually read it.
+      vision: members.some(entry => entry.vision === true),
       reasoning: members.some(entry => entry.reasoning === true),
       // A foreign link with no published window must not silently raise the
       // chain's advertised capacity, so only known windows take part; a chain
@@ -251,24 +268,44 @@ export function chainMemberRows(own, foreign, isHidden) {
  * @param {{peek?: boolean, foreign?: (id: string) => object | undefined}} [options]
  *   `peek` computes the order without consuming a turn
  */
-export function comboChain(entry, catalog, options = {}) {
+/**
+ * Resolve a combo's stored link ids into real catalog rows, in stored order.
+ *
+ * Split out of {@link comboChain} so a caller can inspect the *unbenched* roster
+ * — which is what decides whether a bench has to be retired because every link
+ * in it is resting.
+ *
+ * @param {object} entry - a combo catalog row
+ * @param {Array<object>} catalog
+ * @param {{foreign?: (id: string) => object | undefined}} [options]
+ */
+export function comboMembers(entry, catalog, options = {}) {
   const ids = Array.isArray(entry?.combo) ? entry.combo : []
   const byId = new Map()
   for (const row of catalog) byId.set(row.id, row)
   const lookupForeign = options.foreign ?? (() => undefined)
-  const members = ids
+  return ids
     .map(id => byId.get(id) ?? lookupForeign(id))
     .filter(row => row !== undefined)
-  if (members.length <= 1 || entry.strategy !== 'round-robin') return members
+}
+
+export function comboChain(entry, catalog, options = {}) {
+  const members = comboMembers(entry, catalog, options)
+  // Links that failed over recently are demoted to the back, so the turn starts
+  // at the first one still standing instead of re-asking a dead head every time.
+  // Relative order is preserved on both sides, so the user's quality ladder
+  // still governs which *healthy* link is tried first.
+  const ordered = preferHealthy(members, options.benched)
+  if (ordered.length <= 1 || entry.strategy !== 'round-robin') return ordered
   const limit = Number.isFinite(Number(entry.stickyLimit)) && Number(entry.stickyLimit) > 0 ? Math.trunc(Number(entry.stickyLimit)) : 1
   const cursor = rotation.get(entry.id) ?? { index: 0, used: 0 }
-  const index = Math.min(Math.max(cursor.index, 0), members.length - 1)
-  const ordered = [...members.slice(index), ...members.slice(0, index)]
+  const index = Math.min(Math.max(cursor.index, 0), ordered.length - 1)
+  const rotated = [...ordered.slice(index), ...ordered.slice(0, index)]
   if (options.peek !== true) {
     const used = cursor.used + 1
-    rotation.set(entry.id, used >= limit ? { index: (index + 1) % members.length, used: 0 } : { index, used })
+    rotation.set(entry.id, used >= limit ? { index: (index + 1) % ordered.length, used: 0 } : { index, used })
   }
-  return ordered
+  return rotated
 }
 
 /** Drop rotation cursors for combos that no longer exist, so the map cannot grow forever. */

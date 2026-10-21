@@ -73,8 +73,11 @@ try {
     // 已知窗口只有 free-a 的 200000；外部行没有数字，不能当成无限大，
     // 也不能把链路拉低到一个编造的值。
     assert.equal(entry.contextWindow, 200000)
-    // 交集语义不变：外部行未声明视觉，因此整条链不宣称视觉。
-    assert.equal(entry.vision, false)
+    // 容量仍是交集（外部行没有数字，不能当无限大）。
+    // 视觉不再取交集：宿主按 `inputModalities` 决定把图片保留还是替换成文本
+    // 占位符，交集会令整条链拒绝图片，能看图的成员永远收不到。真正的保护改在
+    // `runCombo` 里 —— 带图回合只走声明支持图片的成员（见下面的用例）。
+    assert.equal(entry.vision, true, '链路有成员能看图，就应当接受图片')
   })
 
   await check('外部模型走宿主 llm.stream()，而不是本插件的上游', async () => {
@@ -387,6 +390,82 @@ try {
     assert.deepEqual(dispatched, ['buddy', 'codearts'], `链路没有降级，只尝试了 ${dispatched.join(',') || '（无）'}`)
     const text = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text).join('')
     assert.equal(text, 'HEALTHY_ANSWER')
+  })
+
+  await check('带图回合只走能看图的成员，纯文本成员被跳过', async () => {
+    resetRotation()
+    // 线上形状：链路里 codearts 是纯文本（渠道包 llm-adapter.ts 硬编码
+    // inputModalities: ['text']），buddy 等能看图。旧交集语义下整条链宣告纯
+    // 文本，宿主在准入阶段就把图片换成文本占位符，模型于是回答"看不到图片"。
+    const blind = { id: 'codearts/deepseek-v4.1-flash', model: 'deepseek-v4.1-flash', name: 'C', provider: 'codearts', channel: 'codearts', foreign: true, vision: false }
+    const sighted = { id: 'buddy/deepseek-v4.1-flash', model: 'deepseek-v4.1-flash', name: 'B', provider: 'buddy', channel: 'buddy', foreign: true, vision: true }
+    const foreign = new Map([[blind.id, blind], [sighted.id, sighted]])
+
+    const dispatched = []
+    const adapter = new FreeModelAdapter({
+      state: () => ({ catalog: ownCatalog, membership: {}, settings: {}, attributionUserAgent: 'test' }),
+      recordUsage: () => {},
+      recordTurn: () => {},
+      resolveForeignLink: id => foreign.get(id),
+      dispatchForeign: options => {
+        dispatched.push(options.provider)
+        return (async function* () {
+          yield { type: 'text-delta', text: 'SEEN' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    })
+
+    const combos = normalizeCombos([{ name: 'vision', models: [blind.id, sighted.id] }])
+    const [entry] = buildComboCatalog(combos, [], { foreign: id => foreign.get(id) })
+    assert.equal(entry.vision, true, '链路应宣称可接收图片')
+    const snapshot = { catalog: [entry], settings: {}, attributionUserAgent: 'test' }
+
+    // 一个带图回合：user 消息里有一个 image 块。
+    const messages = [{ role: 'user', content: [
+      { type: 'text', text: '这是什么？' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+    ] }]
+
+    const chunks = []
+    for await (const chunk of adapter.runStream({ model: entry.id, messages, provider: 'our-free-model' }, entry, snapshot)) {
+      chunks.push(chunk)
+    }
+
+    // 链首的 codearts 是纯文本，必须被跳过；图片只能交给 buddy。
+    assert.deepEqual(dispatched, ['buddy'], `图片被发给了 ${dispatched.join(',') || '（无）'}`)
+    assert.equal(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text).join(''), 'SEEN')
+  })
+
+  await check('带图回合若无成员能看图，立即报错而不是让模型对着占位符作答', async () => {
+    resetRotation()
+    const blind = { id: 'codearts/deepseek-v4.1-flash', model: 'deepseek-v4.1-flash', name: 'C', provider: 'codearts', channel: 'codearts', foreign: true, vision: false }
+    const foreign = new Map([[blind.id, blind]])
+    const dispatched = []
+    const adapter = new FreeModelAdapter({
+      state: () => ({ catalog: ownCatalog, membership: {}, settings: {}, attributionUserAgent: 'test' }),
+      recordUsage: () => {},
+      recordTurn: () => {},
+      resolveForeignLink: id => foreign.get(id),
+      dispatchForeign: options => {
+        dispatched.push(options.provider)
+        return (async function* () { yield { type: 'finish', reason: { kind: 'stop' } } })()
+      },
+    })
+
+    const combos = normalizeCombos([{ name: 'blind', models: [blind.id] }])
+    const [entry] = buildComboCatalog(combos, [], { foreign: id => foreign.get(id) })
+    const snapshot = { catalog: [entry], settings: {}, attributionUserAgent: 'test' }
+    const messages = [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }] }]
+
+    const chunks = []
+    for await (const chunk of adapter.runStream({ model: entry.id, messages, provider: 'our-free-model' }, entry, snapshot)) {
+      chunks.push(chunk)
+    }
+    assert.deepEqual(dispatched, [], '纯文本成员仍然收到了图片')
+    const finish = chunks.find(chunk => chunk.type === 'finish')
+    assert.ok(finish && finish.reason.kind === 'error', '没有报错终止')
+    assert.match(String(finish.reason.failure.message), /image/i)
   })
 
   console.log(`chain-members: ${checks}/${checks} 项通过`)

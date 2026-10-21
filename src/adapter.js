@@ -18,7 +18,7 @@
  */
 
 import { applyFingerprint, baseModelId, endpointFor, mintRequestId, sessionForConversation, wireFor } from './upstream.js'
-import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing } from './messages.js'
+import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing, needsVision } from './messages.js'
 import { CODE, UpstreamError, postStreamed } from './http.js'
 import { postSealedStreamed } from './eac.js'
 import { postKiloStreamed } from './kilo.js'
@@ -28,7 +28,8 @@ import { DEFAULT_LEVEL, MIN_BUDGET, budgetFor, defaultEffortFor, effortPatchFor,
 import { createChannel } from './channel.js'
 import { recoveryPolicy, canRecover, canRecoverSilentStop, recoveryMessages, continuationMessages, checkpointFits, addUsage, createBlockTracker } from './recovery.js'
 import { isEacEntry, isKiloEntry } from './catalog.js'
-import { isComboEntry, comboChain } from './combos.js'
+import { isComboEntry, comboChain, comboMembers } from './combos.js'
+import { shouldRetireBench } from './link-health.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
 import { FALLBACK_IMAGE_PRICING } from './image-pricing.js'
@@ -330,6 +331,47 @@ export class FreeModelAdapter {
   }
 
   /**
+   * Rest one link for a day after it failed over.
+   *
+   * Failover used to be a per-turn trick: the chain walked its links, and the
+   * next turn started at the same head that had just been refused. One doomed
+   * request per turn is a tax on latency, and when the refusal is itself
+   * anti-abuse — "unapproved channel", a policy block — the repetition is
+   * exactly the pattern those gates exist to catch. So the link sits out.
+   *
+   * Deliberately *not* conditioned on the failure's kind. A one-day bench of a
+   * healthy link costs at most a sibling answering for a day; a one-minute bench
+   * of a refused account costs another refusal every turn. Erring long is the
+   * safe direction, and the bench clears itself.
+   *
+   * A link that already produced an answer is never benched — `runCombo` only
+   * calls this once it has decided to walk away, and a committed answer returns
+   * before reaching here.
+   *
+   * @param {object} entry - the combo row
+   * @param {object} candidate - the link that failed
+   * @param {object|null|undefined} verdict - its `classifyFailure` result
+   * @param {number} at - turn start, used as the record's timestamp
+   */
+  bench(entry, candidate, verdict, at) {
+    const bench = this.deps.benchLink
+    if (typeof bench !== 'function') return
+    if (candidate === null || candidate === undefined || candidate.id === undefined) return
+    bench({
+      chainId: entry.id,
+      memberId: candidate.id,
+      at: Number.isFinite(at) ? at : Date.now(),
+      kind: verdict?.kind ?? 'unknown',
+      scope: verdict?.scope ?? null,
+      rule: verdict?.rule ?? null,
+      // The provider's own cooldown is recorded for diagnostics only: the bench
+      // duration is the fixed day, but seeing "this link wanted 5s" next to "we
+      // rested it 24h" is how a user tells a jitter from a real refusal.
+      upstreamCooldownMs: Number.isFinite(verdict?.cooldownMs) ? verdict.cooldownMs : 0,
+    })
+  }
+
+  /**
    * Walk a combo's chain until one candidate produces output.
    *
    * The commit rule is the whole design. Chunks are held in a buffer until the
@@ -354,10 +396,53 @@ export class FreeModelAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: 'our free model is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return
     }
-    const candidates = comboChain(entry, snapshot.catalog, { foreign: this.deps.resolveForeignLink })
-    if (candidates.length === 0) {
+    const members = comboMembers(entry, snapshot.catalog, { foreign: this.deps.resolveForeignLink })
+    if (members.length === 0) {
       rejectedTurn(0)
       yield { type: 'finish', reason: { kind: 'error', failure: { message: `the chain "${entry.name}" has no model available on this egress`, code: CODE.server } } }
+      return
+    }
+    // Links that failed over in the last day sit out, so a turn no longer begins
+    // by re-asking a head that is known to be refused. The bench is read once per
+    // turn: a link benched *during* this walk is simply already behind us.
+    const benchNow = Date.now()
+    const benched = this.deps.benchedLinks?.(entry.id, benchNow) ?? new Set()
+    // Every link resting: clear the bench and start from the head rather than
+    // leaving the whole chain dead for a day. This is the "kept failing, back to
+    // the first one" case, and it also covers transient failures that have since
+    // healed.
+    if (shouldRetireBench(members, benched)) {
+      benched.clear()
+      this.deps.retireBench?.(entry.id)
+      this.deps.warn?.(`our-free-model: every link in "${entry.name}" is benched — clearing the bench and starting over from the head`)
+    }
+    const ordered = comboChain(entry, snapshot.catalog, { foreign: this.deps.resolveForeignLink, benched })
+    /**
+     * An image-bearing turn may only walk the members that can read it.
+     *
+     * The chain now advertises image input when *any* member supports it (see
+     * `buildComboCatalog`), which is what keeps the host from replacing the
+     * attachment with a text placeholder before we ever see it. The price of
+     * that is this filter: handing the image to a text-only member would make
+     * the host project it back into a placeholder, and the model would answer
+     * "I cannot see the image" — the exact symptom that made the chain
+     * advertise the intersection in the first place.
+     *
+     * Filtering is not falling back to nothing: if no member can read images the
+     * turn ends with a message that says so, instead of a model quietly
+     * answering about a placeholder.
+     */
+    const wantsVision = needsVision(options.messages)
+    const candidates = wantsVision
+      ? ordered.filter(candidate => candidate.vision === true)
+      : ordered
+    if (wantsVision && candidates.length === 0) {
+      rejectedTurn(0)
+      this.deps.warn?.(`our-free-model: chain "${entry.name}" got an image turn but no member can read images`)
+      yield { type: 'finish', reason: { kind: 'error', failure: {
+        message: `the chain "${entry.name}" was sent an image, but none of its members accepts image input — add a vision-capable model to the chain or send text only`,
+        code: CODE.server,
+      } } }
       return
     }
     const tried = []
@@ -395,13 +480,22 @@ export class FreeModelAdapter {
         // Not a candidate fault — an abort, or a failure that arrived after the
         // single-model recovery budget was spent. Hand the caller the real
         // ending instead of pretending another model could have saved it.
+        //
+        // The link that just failed is still benched: the failure is real for
+        // this account even when another link could not have answered the same
+        // request (an aborted turn is the exception, hence the guard).
+        if (options.signal?.aborted !== true && result?.benchable !== false) this.bench(entry, candidate, result?.verdict, started)
         for (const chunk of held) yield chunk
         rejectedTurn(index + 1)
         return
       }
       const reason = result.verdict === null || result.verdict === undefined ? 'failed' : describeVerdict(result.verdict)
       tried.push(`${candidate.id} (${reason})`)
-      this.deps.warn?.(`our-free-model: chain "${entry.name}" advanced past ${candidate.id} — ${reason}`)
+      // Bench the link we are walking away from. Keyed by chain + member: the
+      // same model in another chain is a different question, and the reason this
+      // exists is that re-asking a refused account every turn is what escalates
+      // into an anti-abuse block.
+      this.bench(entry, candidate, result.verdict, started)
     }
     rejectedTurn(candidates.length)
     yield { type: 'finish', reason: { kind: 'error', failure: {

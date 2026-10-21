@@ -144,16 +144,24 @@ await check('non-Latin chain names survive normalization and a JSON settings rou
   assert.equal(comboId('  '), '', 'an empty name still has no identity')
 })
 
-await check('mixed-lane chains retain composite member ids and advertise the capability intersection (#372)', () => {
+await check('mixed-lane chains retain composite member ids; capacities intersect, vision does not (#372)', () => {
   const members = [
     { id: 'free-model', channel: 'free', vision: true, contextWindow: 131072, maxOutput: 16384 },
     { id: 'open_router/google/gemma:free', channel: 'aggregate', vision: false, contextWindow: 1000000, maxOutput: 32768 },
   ]
   const normalized = normalizeCombos([{ name: CHINESE_NAME, models: members.map(row => row.id) }])
   const [entry] = buildComboCatalog(normalized, members)
+  // Capacities stay the intersection: a chain must not advertise a window or an
+  // output ceiling that one of its members cannot honour.
   assert.equal(entry.contextWindow, 131072)
   assert.equal(entry.maxOutput, 16384)
-  assert.equal(entry.vision, false)
+  // Vision is the documented exception. The host keeps or replaces an attached
+  // image by reading the modalities the adapter publishes, so the intersection
+  // made the *whole* chain refuse images and the member that could read one
+  // never saw it. `runCombo` restricts an image-bearing turn to the members that
+  // support it instead — that is where a text-only member is kept out, and
+  // chain-members-test.mjs covers it.
+  assert.equal(entry.vision, true, 'vision must mean "any member", not unanimity')
   assert.deepEqual(entry.combo, members.map(row => row.id))
   assert.deepEqual(comboChain(entry, members).map(row => row.id), entry.combo)
 })

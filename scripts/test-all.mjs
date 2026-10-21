@@ -55,6 +55,7 @@ const suites = [
   ['channel-network', 'channel-network-test.mjs', []],
   ['channel-quota-network', 'channel-quota-network-test.mjs', []],
   ['chain-members', 'chain-members-test.mjs', []],
+  ['link-bench', 'link-bench-test.mjs', []],
   ['channel-credits-rpc', 'channel-credits-rpc-test.mjs', []],
   ['channel-credits-ui', 'channel-credits-ui-test.mjs', []],
   ['channel-model-actions', 'channel-model-actions-test.mjs', []],

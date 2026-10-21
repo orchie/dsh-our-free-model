@@ -4,6 +4,7 @@ import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
 import { buildCatalog, buildEacCatalog, buildKiloCatalog, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
+import { LINK_BENCH_MS, benchedMembers, emptyLinkHealth, linkKey, pruneLinkHealth } from '../link-health.js'
 import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
 import { STATE, detectEgress, probeCatalog } from '../probe.js'
 import { CODE, getJson } from '../http.js'
@@ -40,11 +41,15 @@ export function createRuntimeStores({ dataDir, logger = console }) {
   const stats = open('stats.json', STATS_INITIAL)
   const availability = open('availability.json', { version: 1, at: 0, egress: null, results: {} })
   const catalogStore = open('catalog.json', { version: 1, at: 0, entries: FALLBACK_CATALOG.map(entry => entry.id) })
+  // Which chain links are sitting out, and until when. On disk rather than in
+  // memory because a restart is exactly when a stale head would otherwise get
+  // one more doomed request per turn.
+  const linkHealth = open('link-health.json', emptyLinkHealth())
   if (stats.get().version !== STATS_VERSION) stats.edit(migrateStats)
   return {
-    settings, stats, availability, catalogStore,
+    settings, stats, availability, catalogStore, linkHealth,
     dispose() {
-      settings.dispose(); stats.dispose(); availability.dispose(); catalogStore.dispose()
+      settings.dispose(); stats.dispose(); availability.dispose(); catalogStore.dispose(); linkHealth.dispose()
     },
   }
 }
@@ -54,7 +59,7 @@ export function createRuntimeStores({ dataDir, logger = console }) {
  * 创建不启动网络任务；入口先绑定本地监听器，再决定何时刷新和探测。
  */
 export function createModelRuntime({
-  settings, stats, availability, catalogStore,
+  settings, stats, availability, catalogStore, linkHealth,
   logger = console,
   attributionUserAgent = 'our-free-model',
   resolveImage,
@@ -115,6 +120,22 @@ export function createModelRuntime({
     }
     catalog = merged
   }
+  /**
+   * Every `chainId\0memberId` pair that currently exists.
+   *
+   * The bench file would otherwise grow forever: renaming a chain or removing a
+   * member leaves a record that nothing will ever read. This is also why a
+   * *removed and re-added* member comes back healthy — it is a new link, and the
+   * user re-added it on purpose.
+   */
+  const liveLinkKeys = () => {
+    const live = new Set()
+    for (const combo of normalizeCombos(settings.get().combos)) {
+      if (combo.enabled === false) continue
+      for (const memberId of combo.models) live.add(linkKey(combo.id, memberId))
+    }
+    return live
+  }
   const mergeCatalogs = () => {
     aggregateCatalog = buildAggregateCatalog(settings.get().aggregate ?? {})
     rebuildCatalog()
@@ -139,6 +160,41 @@ export function createModelRuntime({
       stats.edit(value => pruneDays(value, 120))
     },
     recordTurn: record => { if (!disposed) recordTurn(stats, record) },
+    /** Which of this chain's links are still resting. Read fresh every turn. */
+    benchedLinks: (chainId, now) => benchedMembers(linkHealth.get(), chainId, now),
+    /**
+     * Rest a link for a day after it failed over.
+     *
+     * Written through the store so it survives a restart, and pruned on write so
+     * a chain the user deleted cannot leave records behind forever.
+     */
+    benchLink: record => {
+      if (disposed) return
+      const now = Date.now()
+      const live = liveLinkKeys()
+      linkHealth.edit(value => {
+        const next = pruneLinkHealth(value, now, live)
+        next.links[linkKey(record.chainId, record.memberId)] = {
+          until: record.at + LINK_BENCH_MS,
+          at: record.at,
+          kind: record.kind,
+          scope: record.scope,
+          rule: record.rule,
+          upstreamCooldownMs: record.upstreamCooldownMs,
+        }
+        return next
+      })
+    },
+    /** Every link in this chain is resting: clear the bench, start from the head. */
+    retireBench: chainId => {
+      if (disposed) return
+      const prefix = `${chainId}\u0000`
+      linkHealth.edit(value => {
+        const next = { ...value, links: { ...(value?.links ?? {}) } }
+        for (const key of Object.keys(next.links)) if (key.startsWith(prefix)) delete next.links[key]
+        return next
+      })
+    },
     warn: message => logger.warn?.(message) ?? logger.log?.(message),
     onRegionBlocked: () => {
       if (disposed || reprobeTimer !== undefined) return

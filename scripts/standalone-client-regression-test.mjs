@@ -176,7 +176,9 @@ let editor = render(ChainEditor, editorProps)
 let capacity = nodes(editor).find(node => node.type === ChainCapacity).props.capacity
 assert.equal(capacity.contextWindow, 128000)
 assert.equal(capacity.maxOutput, 16000)
-assert.equal(capacity.vision, false)
+// 容量仍取交集，视觉不取：宿主按 `inputModalities` 决定保留还是替换附件，交集
+// 会让整条链拒绝图片。真正的保护是 `runCombo` 只把带图回合交给能看图的成员。
+assert.equal(capacity.vision, true, 'vision means "any member can read images"')
 effects.length = 0
 button(editor, t('routing.removeMember')).props.onClick()
 render(ChainEditor, editorProps)

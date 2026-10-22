@@ -157,7 +157,14 @@ async function mount({ withOutlet }) {
   }
 
   pack.apply(ctx, withOutlet
-    ? { disableOpencode: true, outlet: { active: () => true, fetch: outletFetch } }
+    ? {
+        disableOpencode: true,
+        // ⚠️ `createDirectFetch` 走的是「签名传输」这条出口契约：出口必须实现
+        // `fetchSigned(input, init, send)`，否则该层直接抛错（PR #483 的签名
+        // 隔离）。只给 `fetch` 的出口在这里会被判为「未接入签名传输」，
+        // 请求不会真的发出——那会让本套件误判成「没走封装」。
+        outlet: { active: () => true, fetch: outletFetch, fetchSigned: outletFetch },
+      }
     : { disableOpencode: true })
 
   const route = routes.find((row) => row.path === '/api/channel-pack')
@@ -221,7 +228,7 @@ try {
       assert.equal(
         app.proxied.some((url) => url.includes(QUOTA_PATH)),
         true,
-        `配额端点没有走渠道出网封装；实际直连：${JSON.stringify(app.direct)}`,
+        `配额端点没有走渠道出网封装；经过封装：${JSON.stringify(app.proxied)}；实际直连：${JSON.stringify(app.direct)}`,
       )
       assert.equal(
         app.direct.some((url) => url.includes(QUOTA_PATH)),

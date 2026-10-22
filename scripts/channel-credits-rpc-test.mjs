@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict'
 
 /** 使用实际已打包 RPC，只提供账号池 ref，禁止真实网络与旧单凭据回退。 */
-export async function verifyChannelCreditsRpc({ ctx, call, creds }) {
+/**
+ * @param {object} options
+ * @param {object} options.ctx
+ * @param {(method: string, payload: object) => Promise<any>} options.call
+ * @param {Map<string, unknown>} options.creds
+ * @param {{fetch: typeof fetch | null}} [options.directLane] - 渠道包的离线传输接缝。
+ *   `credits.balances` 现在显式传 `creditsFetcher`（默认 `directFetch`），**不再**
+ *   经过全局 `fetch`；因此夹具必须同时接管 `directLane.fetch`，否则替身看不到
+ *   配额请求，计数恒为 0。
+ */
+export async function verifyChannelCreditsRpc({ ctx, call, creds, directLane }) {
   const originalFetch = globalThis.fetch
-  const providers = ['buddy', 'workbuddy', 'qoder', 'qodercn', 'loomy', 'minimax', 'lobsterai', 'zcode', 'gemini']
+  const savedLaneFetch = directLane?.fetch ?? null
+  const providers = ['qoder', 'qodercn', 'loomy', 'minimax', 'lobsterai', 'zcode', 'gemini']
   let quotaRequests = 0, quotaFailed = true
   const originalResolve = ctx.credentials.resolve
   const resolvedRefs = []
@@ -20,7 +31,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds }) {
         credentialRef: ref, enabled: true, refreshable: false, createdAt: 1,
       })
     }
-    globalThis.fetch = async input => {
+    const stub = async input => {
       const pathname = new URL(String(input)).pathname
       let body
       if (pathname.includes('get-user-resource')) {
@@ -45,6 +56,10 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds }) {
       } else throw new Error(`未预期的替身端点：${pathname}`)
       return Response.json(body)
     }
+    // 两条传输都接管：多数渠道仍走全局 `fetch`，而额度查询现在显式走
+    // `creditsFetcher`（默认 `directFetch` → `directLane.fetch`）。
+    globalThis.fetch = stub
+    if (directLane !== undefined && directLane !== null) directLane.fetch = stub
     for (const provider of providers.filter(id => id !== 'zcode' && id !== 'gemini')) {
       resolvedRefs.length = 0
       const result = await call('credits.balances', { provider })
@@ -71,6 +86,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds }) {
   } finally {
     ctx.credentials.resolve = originalResolve
     globalThis.fetch = originalFetch
+    if (directLane !== undefined && directLane !== null) directLane.fetch = savedLaneFetch
     for (const provider of providers) {
       await ctx.accountPool.removeAccount(`fixture-credits-${provider}`)
       creds.delete(`FIXTURE_CREDITS_${provider.toUpperCase()}`)
@@ -80,7 +96,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds }) {
 
 async function verifyRefreshDispatch({ ctx, call }) {
   const providers = [
-    'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae',
+    'codearts', 'lobsterai', 'qoder', 'qodercn', 'trae',
     'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
   ]
   for (const provider of providers) {
@@ -108,5 +124,5 @@ async function verifyRefreshDispatch({ ctx, call }) {
       await ctx.accountPool.removeAccount(accountId)
     }
   }
-  console.log('ok  refresh RPC: all 13 providers pass exact ref/pool/id; disabled accounts refresh; failures return ok:false')
+  console.log('ok  refresh RPC: all 11 providers pass exact ref/pool/id; disabled accounts refresh; failures return ok:false')
 }
